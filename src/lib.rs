@@ -42,19 +42,23 @@
 //! }
 //! ```
 
-use std::char;
-use std::error;
-use std::fmt::{self, Display};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::io::{Seek, SeekFrom};
-use std::ops::{Index, IndexMut};
-use std::path::Path;
-use std::str::Chars;
+use std::{
+    borrow::Cow,
+    char, error,
+    fmt::{self, Display},
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    ops::{Index, IndexMut},
+    path::Path,
+    str::Chars,
+};
 
 use cfg_if::cfg_if;
-use ordered_multimap::list_ordered_multimap::{Entry, Iter, IterMut, OccupiedEntry, VacantEntry};
-use ordered_multimap::ListOrderedMultimap;
+use ordered_multimap::{
+    list_ordered_multimap::{Entry, IntoIter, Iter, IterMut, OccupiedEntry, VacantEntry},
+    ListOrderedMultimap,
+};
+use trim_in_place::TrimInPlace;
 #[cfg(feature = "case-insensitive")]
 use unicase::UniCase;
 
@@ -348,10 +352,11 @@ impl<'a> SectionSetter<'a> {
     }
 
     /// Set (replace) key-value pair in this section (all with the same name)
-    pub fn set<K, V>(&'a mut self, key: K, value: V) -> &'a mut SectionSetter<'a>
+    pub fn set<'b, K, V>(&'b mut self, key: K, value: V) -> &'b mut SectionSetter<'a>
     where
         K: Into<String>,
         V: Into<String>,
+        'a: 'b,
     {
         self.ini
             .entry(self.section_name.clone())
@@ -361,8 +366,27 @@ impl<'a> SectionSetter<'a> {
         self
     }
 
+    /// Add (append) key-value pair in this section
+    pub fn add<'b, K, V>(&'b mut self, key: K, value: V) -> &'b mut SectionSetter<'a>
+    where
+        K: Into<String>,
+        V: Into<String>,
+        'a: 'b,
+    {
+        self.ini
+            .entry(self.section_name.clone())
+            .or_insert_with(Default::default)
+            .append(key, value);
+
+        self
+    }
+
     /// Delete the first entry in this section with `key`
-    pub fn delete<K: AsRef<str>>(&'a mut self, key: &K) -> &'a mut SectionSetter<'a> {
+    pub fn delete<'b, K>(&'b mut self, key: &K) -> &'b mut SectionSetter<'a>
+    where
+        K: AsRef<str>,
+        'a: 'b,
+    {
         for prop in self.ini.section_all_mut(self.section_name.as_ref()) {
             prop.remove(key);
         }
@@ -371,7 +395,7 @@ impl<'a> SectionSetter<'a> {
     }
 
     /// Get the entry in this section with `key`
-    pub fn get<K: AsRef<str>>(&'a mut self, key: K) -> Option<&'a str> {
+    pub fn get<K: AsRef<str>>(&'a self, key: K) -> Option<&'a str> {
         self.ini
             .section(self.section_name.as_ref())
             .and_then(|prop| prop.get(key))
@@ -402,8 +426,17 @@ impl Properties {
     }
 
     /// Get an iterator of the properties
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&str, &str)> {
-        self.data.iter().map(|(k, v)| (k.as_ref(), v.as_str()))
+    pub fn iter(&self) -> PropertyIter {
+        PropertyIter {
+            inner: self.data.iter(),
+        }
+    }
+
+    /// Get a mutable iterator of the properties
+    pub fn iter_mut(&mut self) -> PropertyIterMut {
+        PropertyIterMut {
+            inner: self.data.iter_mut(),
+        }
     }
 
     /// Return true if property exist
@@ -462,6 +495,104 @@ impl<S: AsRef<str>> Index<S> for Properties {
         match self.get(s) {
             Some(p) => p,
             None => panic!("Key `{}` does not exist", s),
+        }
+    }
+}
+
+pub struct PropertyIter<'a> {
+    inner: Iter<'a, PropertyKey, String>,
+}
+
+impl<'a> Iterator for PropertyIter<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, v)| (k.as_ref(), v.as_ref()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for PropertyIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, v)| (k.as_ref(), v.as_ref()))
+    }
+}
+
+/// Iterator for traversing sections
+pub struct PropertyIterMut<'a> {
+    inner: IterMut<'a, PropertyKey, String>,
+}
+
+impl<'a> Iterator for PropertyIterMut<'a> {
+    type Item = (&'a str, &'a mut String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, v)| (k.as_ref(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for PropertyIterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, v)| (k.as_ref(), v))
+    }
+}
+
+pub struct PropertiesIntoIter {
+    inner: IntoIter<PropertyKey, String>,
+}
+
+impl Iterator for PropertiesIntoIter {
+    type Item = (String, String);
+
+    #[cfg_attr(not(feature = "case-insensitive"), allow(clippy::useless_conversion))]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, v)| (k.into(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for PropertiesIntoIter {
+    #[cfg_attr(not(feature = "case-insensitive"), allow(clippy::useless_conversion))]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, v)| (k.into(), v))
+    }
+}
+
+impl<'a> IntoIterator for &'a Properties {
+    type IntoIter = PropertyIter<'a>;
+    type Item = (&'a str, &'a str);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Properties {
+    type IntoIter = PropertyIterMut<'a>;
+    type Item = (&'a str, &'a mut String);
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl IntoIterator for Properties {
+    type IntoIter = PropertiesIntoIter;
+    type Item = (String, String);
+
+    fn into_iter(self) -> Self::IntoIter {
+        PropertiesIntoIter {
+            inner: self.data.into_iter(),
         }
     }
 }
@@ -607,7 +738,7 @@ impl Ini {
     /// Get the entry
     #[cfg(not(feature = "case-insensitive"))]
     pub fn entry(&mut self, name: Option<String>) -> SectionEntry<'_> {
-        SectionEntry::from(self.sections.entry(name.map(|s| s)))
+        SectionEntry::from(self.sections.entry(name))
     }
 
     /// Get the entry
@@ -973,6 +1104,29 @@ impl DoubleEndedIterator for SectionIterMut<'_> {
     }
 }
 
+/// Iterator for traversing sections
+pub struct SectionIntoIter {
+    inner: IntoIter<SectionKey, Properties>,
+}
+
+impl Iterator for SectionIntoIter {
+    type Item = (SectionKey, Properties);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for SectionIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
+    }
+}
+
 impl<'a> Ini {
     /// Immutable iterate though sections
     pub fn iter(&'a self) -> SectionIter<'a> {
@@ -996,8 +1150,8 @@ impl<'a> Ini {
 }
 
 impl<'a> IntoIterator for &'a Ini {
-    type Item = (Option<&'a str>, &'a Properties);
     type IntoIter = SectionIter<'a>;
+    type Item = (Option<&'a str>, &'a Properties);
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -1005,11 +1159,22 @@ impl<'a> IntoIterator for &'a Ini {
 }
 
 impl<'a> IntoIterator for &'a mut Ini {
-    type Item = (Option<&'a str>, &'a mut Properties);
     type IntoIter = SectionIterMut<'a>;
+    type Item = (Option<&'a str>, &'a mut Properties);
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
+    }
+}
+
+impl IntoIterator for Ini {
+    type IntoIter = SectionIntoIter;
+    type Item = (SectionKey, Properties);
+
+    fn into_iter(self) -> Self::IntoIter {
+        SectionIntoIter {
+            inner: self.sections.into_iter(),
+        }
     }
 }
 
@@ -1027,7 +1192,7 @@ struct Parser<'a> {
 pub struct ParseError {
     pub line: usize,
     pub col: usize,
-    pub msg: String,
+    pub msg: Cow<'static, str>,
 }
 
 impl Display for ParseError {
@@ -1083,10 +1248,6 @@ impl<'a> Parser<'a> {
         p
     }
 
-    fn eof(&self) -> bool {
-        self.ch.is_none()
-    }
-
     fn bump(&mut self) {
         self.ch = self.rdr.next();
         match self.ch {
@@ -1101,12 +1262,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn error<U, M: Into<String>>(&self, msg: M) -> Result<U, ParseError> {
+    #[cold]
+    #[inline(never)]
+    fn error<U, M: Into<Cow<'static, str>>>(&self, msg: M) -> Result<U, ParseError> {
         Err(ParseError {
             line: self.line + 1,
             col: self.col + 1,
             msg: msg.into(),
         })
+    }
+
+    #[cold]
+    fn eof_error(&self, expecting: &[Option<char>]) -> Result<char, ParseError> {
+        self.error(format!("expecting \"{:?}\" but found EOF.", expecting))
+    }
+
+    fn char_or_eof(&self, expecting: &[Option<char>]) -> Result<char, ParseError> {
+        match self.ch {
+            Some(ch) => Ok(ch),
+            None => self.eof_error(expecting),
+        }
     }
 
     /// Consume all the white space until the end of the line or a tab
@@ -1151,9 +1326,9 @@ impl<'a> Parser<'a> {
                     self.parse_comment();
                 }
                 '[' => match self.parse_section() {
-                    Ok(sec) => {
-                        let msec = sec[..].trim();
-                        cursec = Some((*msec).to_string());
+                    Ok(mut sec) => {
+                        sec.trim_in_place();
+                        cursec = Some(sec);
                         match result.entry(cursec.clone()) {
                             SectionEntry::Vacant(v) => {
                                 v.insert(Default::default());
@@ -1170,8 +1345,8 @@ impl<'a> Parser<'a> {
                         return self.error("missing key");
                     }
                     match self.parse_val() {
-                        Ok(val) => {
-                            let mval = val[..].trim().to_owned();
+                        Ok(mut mval) => {
+                            mval.trim_in_place();
                             match result.entry(cursec.clone()) {
                                 SectionEntry::Vacant(v) => {
                                     // cursec must be None (the General Section)
@@ -1190,8 +1365,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => match self.parse_key() {
-                    Ok(key) => {
-                        let mkey: String = key[..].trim().to_owned();
+                    Ok(mut mkey) => {
+                        mkey.trim_in_place();
                         curkey = mkey;
                     }
                     Err(e) => return Err(e),
@@ -1216,83 +1391,97 @@ impl<'a> Parser<'a> {
     fn parse_str_until(&mut self, endpoint: &[Option<char>], check_inline_comment: bool) -> Result<String, ParseError> {
         let mut result: String = String::new();
 
+        let mut in_line_continuation = false;
+
         while !endpoint.contains(&self.ch) {
-            match self.ch {
-                None => {
-                    return self.error(format!("expecting \"{:?}\" but found EOF.", endpoint));
-                }
+            match self.char_or_eof(endpoint)? {
                 #[cfg(feature = "inline-comment")]
-                Some(space) if check_inline_comment && (space == ' ' || space == '\t') => {
+                ch if check_inline_comment && (ch == ' ' || ch == '\t') => {
                     self.bump();
 
                     match self.ch {
                         Some('#') | Some(';') => {
                             // [space]#, [space]; starts an inline comment
-                            break;
+                            self.parse_comment();
+                            if in_line_continuation {
+                                result.push(ch);
+                                continue;
+                            } else {
+                                break;
+                            }
                         }
                         Some(_) => {
-                            result.push(space);
+                            result.push(ch);
                             continue;
                         }
                         None => {
-                            result.push(space);
+                            result.push(ch);
                         }
                     }
                 }
-                Some('\\') if self.opt.enabled_escape => {
+                #[cfg(feature = "inline-comment")]
+                ch if check_inline_comment && in_line_continuation && (ch == '#' || ch == ';') => {
+                    self.parse_comment();
+                    continue;
+                }
+                '\\' => {
                     self.bump();
-                    if self.eof() {
-                        return self.error(format!("expecting \"{:?}\" but found EOF.", endpoint));
-                    }
-                    match self.ch.unwrap() {
-                        '0' => result.push('\0'),
-                        'a' => result.push('\x07'),
-                        'b' => result.push('\x08'),
-                        't' => result.push('\t'),
-                        'r' => result.push('\r'),
-                        'n' => result.push('\n'),
-                        '\n' => (),
-                        'x' => {
-                            // Unicode 4 character
-                            let mut code: String = String::with_capacity(4);
-                            for _ in 0..4 {
-                                self.bump();
-                                if self.eof() {
-                                    return self.error(format!("expecting \"{:?}\" but found EOF.", endpoint));
-                                } else if let Some('\\') = self.ch {
+                    let Some(ch) = self.ch else {
+                        result.push('\\');
+                        continue;
+                    };
+
+                    if matches!(ch, '\n') {
+                        in_line_continuation = true;
+                    } else if self.opt.enabled_escape {
+                        match ch {
+                            '0' => result.push('\0'),
+                            'a' => result.push('\x07'),
+                            'b' => result.push('\x08'),
+                            't' => result.push('\t'),
+                            'r' => result.push('\r'),
+                            'n' => result.push('\n'),
+                            '\n' => self.bump(),
+                            'x' => {
+                                // Unicode 4 character
+                                let mut code: String = String::with_capacity(4);
+                                for _ in 0..4 {
                                     self.bump();
-                                    if self.ch != Some('\n') {
-                                        return self.error(format!(
-                                            "expecting \"\\\\n\" but \
+                                    let ch = self.char_or_eof(endpoint)?;
+                                    if ch == '\\' {
+                                        self.bump();
+                                        if self.ch != Some('\n') {
+                                            return self.error(format!(
+                                                "expecting \"\\\\n\" but \
                                              found \"{:?}\".",
-                                            self.ch
-                                        ));
+                                                self.ch
+                                            ));
+                                        }
                                     }
+
+                                    code.push(ch);
                                 }
-                                code.push(self.ch.unwrap());
+                                let r = u32::from_str_radix(&code[..], 16);
+                                match r.ok().and_then(char::from_u32) {
+                                    Some(ch) => result.push(ch),
+                                    None => return self.error("unknown character in \\xHH form"),
+                                }
                             }
-                            let r = u32::from_str_radix(&code[..], 16);
-                            match r {
-                                Ok(c) => match char::from_u32(c) {
-                                    Some(c) => result.push(c),
-                                    None => {
-                                        return self.error("unknown character in \\xHH form");
-                                    }
-                                },
-                                Err(_) => return self.error("unknown character in \\xHH form"),
-                            }
+                            c => result.push(c),
                         }
-                        c => result.push(c),
+                    } else {
+                        result.push('\\');
+                        result.push(ch);
                     }
                 }
-                Some(c) => {
-                    result.push(c);
-                }
+                ch => result.push(ch),
             }
             self.bump();
         }
 
         let _ = check_inline_comment;
+        let _ = in_line_continuation;
+
         Ok(result)
     }
 
@@ -1375,11 +1564,6 @@ impl<'a> Parser<'a> {
     #[inline]
     fn parse_str_until_eol(&mut self, check_inline_comment: bool) -> Result<String, ParseError> {
         let r = self.parse_str_until(&[Some('\n'), Some('\r'), None], check_inline_comment)?;
-
-        #[cfg(feature = "inline-comment")]
-        if check_inline_comment && matches!(self.ch, Some('#') | Some(';')) {
-            self.parse_comment();
-        }
 
         Ok(r)
     }
@@ -1665,6 +1849,48 @@ Otherline\"
     }
 
     #[test]
+    fn string_multiline_escape() {
+        let input = r"
+[section name]
+# This is a comment
+Key = Value \
+Otherline
+";
+        let ini = Ini::load_from_str_opt(
+            input,
+            ParseOption {
+                enabled_escape: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ini.get_from(Some("section name"), "Key").unwrap(), "Value Otherline");
+    }
+
+    #[cfg(feature = "inline-comment")]
+    #[test]
+    fn string_multiline_inline_comment() {
+        let input = r"
+[section name]
+# This is a comment
+Key = Value \
+# This is also a comment
+; This is also a comment
+   # This is also a comment
+Otherline
+";
+        let ini = Ini::load_from_str_opt(
+            input,
+            ParseOption {
+                enabled_escape: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ini.get_from(Some("section name"), "Key").unwrap(), "Value    Otherline");
+    }
+
+    #[test]
     fn string_comment() {
         let input = "
 [section name]
@@ -1871,10 +2097,7 @@ Key = 'Value   # This is not a comment ; at all'
     #[test]
     fn load_from_str_noescape() {
         let input = "path=C:\\Windows\\Some\\Folder\\";
-        let opt = Ini::load_from_str_noescape(input);
-        assert!(opt.is_ok());
-
-        let output = opt.unwrap();
+        let output = Ini::load_from_str_noescape(input).unwrap();
         assert_eq!(output.len(), 1);
         let sec = output.section(None::<String>).unwrap();
         assert_eq!(sec.len(), 1);
@@ -2187,6 +2410,37 @@ bar = f
     }
 
     #[test]
+    fn add_properties_api() {
+        // Test duplicate properties in a section
+        let mut ini = Ini::new();
+        ini.with_section(Some("foo")).add("a", "1").add("a", "2");
+
+        let sec = ini.section(Some("foo")).unwrap();
+        assert_eq!(sec.get("a"), Some("1"));
+        assert_eq!(sec.get_all("a").collect::<Vec<&str>>(), vec!["1", "2"]);
+
+        // Test add with unique keys
+        let mut ini = Ini::new();
+        ini.with_section(Some("foo")).add("a", "1").add("b", "2");
+
+        let sec = ini.section(Some("foo")).unwrap();
+        assert_eq!(sec.get("a"), Some("1"));
+        assert_eq!(sec.get("b"), Some("2"));
+
+        // Test string representation
+        let mut ini = Ini::new();
+        ini.with_section(Some("foo")).add("a", "1").add("a", "2");
+        let mut buf = Vec::new();
+        ini.write_to(&mut buf).unwrap();
+        let ini_str = String::from_utf8(buf).unwrap();
+        if cfg!(windows) {
+            assert_eq!(ini_str, "[foo]\r\na=1\r\na=2\r\n");
+        } else {
+            assert_eq!(ini_str, "[foo]\na=1\na=2\n");
+        }
+    }
+
+    #[test]
     fn new_has_empty_general_section() {
         let mut ini = Ini::new();
 
@@ -2404,5 +2658,74 @@ c = d
             assert_eq!(escape_str(test_cjk, policy), r"\x2020c\x20547");
             assert_eq!(escape_str(test_high_points, policy), r"\x10abcd\x10ffff");
         }
+    }
+
+    #[test]
+    fn iter_mut_preserve_order_in_section() {
+        let input = r"
+x2 = nc
+x1 = na
+x3 = nb
+";
+        let mut data = Ini::load_from_str(input).unwrap();
+        let section = data.general_section_mut();
+        section.iter_mut().enumerate().for_each(|(i, (_, v))| {
+            v.push_str(&i.to_string());
+        });
+        let props: Vec<_> = section.iter().collect();
+        assert_eq!(props, vec![("x2", "nc0"), ("x1", "na1"), ("x3", "nb2")]);
+    }
+
+    #[test]
+    fn preserve_order_properties_into_iter() {
+        let input = r"
+x2 = nc
+x1 = na
+x3 = nb
+";
+        let data = Ini::load_from_str(input).unwrap();
+        let (_, section) = data.into_iter().next().unwrap();
+        let props: Vec<_> = section.into_iter().collect();
+        assert_eq!(
+            props,
+            vec![
+                ("x2".to_owned(), "nc".to_owned()),
+                ("x1".to_owned(), "na".to_owned()),
+                ("x3".to_owned(), "nb".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn section_setter_chain() {
+        // fix issue #134
+
+        let mut ini = Ini::new();
+        let mut section_setter = ini.with_section(Some("section"));
+
+        // chained set() calls work
+        section_setter.set("a", "1").set("b", "2");
+        // separate set() calls work
+        section_setter.set("c", "3");
+
+        assert_eq!("1", section_setter.get("a").unwrap());
+        assert_eq!("2", section_setter.get("b").unwrap());
+        assert_eq!("3", section_setter.get("c").unwrap());
+
+        // overwrite values
+        section_setter.set("a", "4").set("b", "5");
+        section_setter.set("c", "6");
+
+        assert_eq!("4", section_setter.get("a").unwrap());
+        assert_eq!("5", section_setter.get("b").unwrap());
+        assert_eq!("6", section_setter.get("c").unwrap());
+
+        // delete entries
+        section_setter.delete(&"a").delete(&"b");
+        section_setter.delete(&"c");
+
+        assert!(section_setter.get("a").is_none());
+        assert!(section_setter.get("b").is_none());
+        assert!(section_setter.get("c").is_none());
     }
 }
